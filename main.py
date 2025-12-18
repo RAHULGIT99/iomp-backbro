@@ -24,7 +24,7 @@ from pinecone import Pinecone, ServerlessSpec
 from pydantic import BaseModel
 from pymongo import ReturnDocument
 from pymongo.errors import ConfigurationError
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # --- Load environment variables ---
 load_dotenv()

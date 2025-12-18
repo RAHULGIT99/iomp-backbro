@@ -9,6 +9,9 @@ python-multipart
 motor
 bcrypt
 PyJWT
+
+langchain
+
 langchain-core
 langchain-community
 langchain-text-splitters

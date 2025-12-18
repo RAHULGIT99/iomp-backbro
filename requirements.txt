@@ -4,10 +4,10 @@ python-dotenv
 requests
 httpx
 pydantic
-pinecone-client
+pinecone
 python-multipart
 motor
 bcrypt
 PyJWT
-pypdf
 langchain
+pypdf

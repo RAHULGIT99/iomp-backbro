@@ -1,11 +1,11 @@
-# sarvam_pinecone_backend.py
-
 import os
 import asyncio
 import base64
 import logging
 import random
 import secrets
+import io
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -14,24 +14,29 @@ import httpx
 import jwt
 import requests
 import uvicorn
+import pypdf
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
-from pinecone import Pinecone
+from pinecone import Pinecone, ServerlessSpec
 from pydantic import BaseModel
 from pymongo import ReturnDocument
 from pymongo.errors import ConfigurationError
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # --- Load environment variables ---
 load_dotenv()
+
+# Pinecone Config
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME") # Default fallback index
 
-if not (PINECONE_API_KEY and PINECONE_INDEX_NAME):
-    raise RuntimeError("Missing pinecone environment variables.")
+if not PINECONE_API_KEY:
+    raise RuntimeError("Missing PINECONE_API_KEY environment variable.")
 
+# Groq Config (Failover Logic)
 numbers = [1, 2, 3]
 selected = random.choice(numbers)
 api_key = "GROQ_API_KEY_" + str(selected)
@@ -39,6 +44,7 @@ GROQ_API_KEY = os.getenv(api_key)
 
 EMBEDDING_API_URL = "https://rahulbro123-embedding-model.hf.space/get_embeddings"
 
+# Sarvam Config
 SARVAM_API_KEY = "sk_f8fjoda1_s83hQcvwfwwmPIwImLdTaReh"
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
 SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
@@ -75,15 +81,10 @@ if MONGO_URI:
                 database = mongo_client[MONGO_DB_NAME]
             else:
                 database = None
-                logger.warning(
-                    "Mongo URI does not include a database name and MONGO_DB_NAME is not set."
-                )
+                logger.warning("Mongo URI does not include a database name and MONGO_DB_NAME is not set.")
         if database is not None:
             users_collection = database[MONGO_USERS_COLLECTION]
-            logger.info(
-                "MongoDB connected for auth features (collection: %s)",
-                MONGO_USERS_COLLECTION,
-            )
+            logger.info("MongoDB connected for auth features (collection: %s)", MONGO_USERS_COLLECTION)
     except Exception as exc:
         logger.error("MongoDB connection error: %s", exc)
 else:
@@ -98,38 +99,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # --- Pinecone Client ---
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX_NAME)
 
 # --- Request/Response Models ---
 class QueryRequest(BaseModel):
     question: str
-
+    index_name: Optional[str] = None # Optional: if not provided, uses default
 
 class RegisterRequest(BaseModel):
     username: str
     email: str
-
 
 class VerifyOtpRequest(BaseModel):
     email: str
     otp: str
     password: str
 
-
 class LoginRequest(BaseModel):
     identifier: str
     password: str
 
+class UploadResponse(BaseModel):
+    success: bool
+    index_name: str
+    message: str
 
+# --- Auth Helper Functions ---
 def _require_user_collection() -> AsyncIOMotorCollection:
     if users_collection is None:
         logger.error("User store not configured; check MongoDB settings.")
         raise HTTPException(status_code=500, detail="User store not configured.")
     return users_collection
-
 
 def _create_access_token(email: str) -> str:
     if not JWT_SECRET:
@@ -139,14 +140,11 @@ def _create_access_token(email: str) -> str:
     payload = {"email": email, "exp": expiry}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-
 def _generate_otp() -> int:
     return secrets.randbelow(900000) + 100000
 
-
 def _normalize_email(email: str) -> str:
     return email.strip().lower()
-
 
 async def _send_otp_email(recipient: str, otp: int) -> None:
     headers = {
@@ -170,7 +168,7 @@ async def _send_otp_email(recipient: str, otp: int) -> None:
         )
         response.raise_for_status()
 
-
+# --- TTS Helper ---
 def _chunk_text_for_tts(text: str, max_chars: int = 480) -> List[str]:
     """Split text into chunks that comply with the API character limit."""
     words = text.strip().split()
@@ -306,20 +304,30 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
 
-async def retrieve_context(query_vector: List[float], top_k: int = 5) -> str:
-    """Search Pinecone for relevant context."""
+async def retrieve_context(query_vector: List[float], index_name: Optional[str] = None, top_k: int = 5) -> str:
+    """Search Pinecone for relevant context. Supports dynamic indexes."""
+    target_index_name = index_name or PINECONE_INDEX_NAME
+    
+    if not target_index_name:
+        logger.warning("No index name provided for context retrieval.")
+        return "" 
+
     try:
-        results = index.query(vector=query_vector, top_k=top_k, include_metadata=True)
+        # Connect to specific index
+        target_index = pc.Index(target_index_name)
+        
+        results = target_index.query(vector=query_vector, top_k=top_k, include_metadata=True)
         if not results.matches:
             return ""
-        return "\n\n---\n\n".join([m["metadata"]["text"] for m in results.matches])
+        return "\n\n---\n\n".join([m["metadata"]["text"] for m in results.matches if "metadata" in m])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Context retrieval failed: {e}")
+        logger.error(f"Context retrieval failed for {target_index_name}: {e}")
+        return ""
 
 async def get_answer(query: str, context: str) -> str:
     """Use Groq LLM to answer based on retrieved context."""
     if not context.strip():
-        return "Sorry I can't find the details."
+        return "Sorry I can't find the details in the knowledge base."
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -351,29 +359,151 @@ async def get_answer(query: str, context: str) -> str:
         return r.json()["choices"][0]["message"]["content"].strip()
 
 # -------------------
+# Document Upload Helpers
+# -------------------
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Reads PDF bytes and extracts text."""
+    try:
+        pdf_stream = io.BytesIO(file_bytes)
+        reader = pypdf.PdfReader(pdf_stream)
+        text = []
+        for page in reader.pages:
+            content = page.extract_text()
+            if content:
+                text.append(content)
+        return "\n".join(text)
+    except Exception as e:
+        logger.error(f"Error extracting PDF: {e}")
+        return ""
+
+def manage_indexes_and_create_sync(new_index_name: str, dimension: int = 768):
+    """
+    Checks current indexes. If >= 5, deletes the first one found.
+    Then creates the new index.
+    """
+    existing_indexes = pc.list_indexes()
+    try:
+        index_names = [i.name for i in existing_indexes]
+    except:
+        index_names = list(existing_indexes.names())
+
+    logger.info(f"Current indexes ({len(index_names)}): {index_names}")
+
+    if len(index_names) >= 5:
+        to_delete = index_names[0]
+        logger.info(f"Limit reached (5). Deleting index: {to_delete}")
+        pc.delete_index(to_delete)
+    
+    logger.info(f"Creating new index: {new_index_name}")
+    pc.create_index(
+        name=new_index_name,
+        dimension=dimension,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
+
+async def process_pdf_and_upsert(index_name: str, full_text: str):
+    # 1. Chunk
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = splitter.split_text(full_text)
+    
+    if not chunks:
+        return
+
+    # 2. Embed
+    logger.info(f"Embedding {len(chunks)} chunks...")
+    vectors = []
+    batch_size = 32
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i+batch_size]
+        batch_vectors = await embed_texts(batch)
+        vectors.extend(batch_vectors)
+
+    # 3. Upsert
+    to_upsert = []
+    for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
+        to_upsert.append({
+            "id": f"doc_{i}_{uuid.uuid4().hex[:8]}",
+            "values": vec,
+            "metadata": {"text": chunk}
+        })
+    
+    def _upsert_sync(vectors_batch):
+        target_index = pc.Index(index_name)
+        # Upsert in batches
+        for i in range(0, len(vectors_batch), 100):
+            target_index.upsert(vectors=vectors_batch[i:i+100])
+    
+    await asyncio.to_thread(_upsert_sync, to_upsert)
+
+# -------------------
+# Document Upload Endpoint
+# -------------------
+@app.post("/document-upload", response_model=UploadResponse)
+async def document_upload(
+    file: UploadFile = File(...), 
+    authorization: Optional[str] = Header(None)
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    # 1. Read File
+    content = await file.read()
+    text = extract_text_from_pdf(content)
+    
+    if not text or len(text.strip()) < 50:
+        raise HTTPException(status_code=400, detail="Could not extract enough text from PDF.")
+
+    # 2. Manage Index (Delete old if needed, Create new)
+    new_index_name = f"pdf-{uuid.uuid4().hex[:8]}"
+    try:
+        await asyncio.to_thread(manage_indexes_and_create_sync, new_index_name)
+    except Exception as e:
+        logger.error(f"Index management error: {e}")
+        raise HTTPException(status_code=500, detail=f"Pinecone Error: {str(e)}")
+
+    # 3. Chunk, Embed, Upsert
+    await process_pdf_and_upsert(new_index_name, text)
+
+    return UploadResponse(
+        success=True, 
+        index_name=new_index_name, 
+        message="PDF processed and uploaded successfully."
+    )
+
+# -------------------
 # Chat Endpoint
 # -------------------
 @app.post("/chat")
 async def chat(request: QueryRequest) -> Dict[str, Any]:
     try:
+        # 1. Embed query
         query_vector = (await embed_texts([request.question]))[0]
-        context = await retrieve_context(query_vector, top_k=5)
+        
+        # 2. Retrieve from specific index or default
+        context = await retrieve_context(query_vector, request.index_name, top_k=5)
 
         # Debug logs
-        print("User query:", request.question)
-        print("Retrieved context:", context)
+        print(f"Query: {request.question}")
+        print(f"Index: {request.index_name}")
+        print(f"Context found: {bool(context)}")
 
+        # 3. Answer
         answer = await get_answer(request.question, context)
 
         return {
             "original_query": request.question,
+            "used_index": request.index_name or PINECONE_INDEX_NAME,
             "answer": answer,
             "context_found": bool(context.strip())
         }
     except Exception as e:
+        logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# -------------------
+# Auth Endpoints
+# -------------------
 @app.post("/register")
 async def register_user(payload: RegisterRequest) -> Dict[str, str]:
     collection = _require_user_collection()
@@ -491,7 +621,9 @@ async def login_user(payload: LoginRequest) -> Dict[str, Any]:
         },
     }
 
-
 @app.get("/")
 def read_root():
     return {"status": "Customer support API is online"}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
